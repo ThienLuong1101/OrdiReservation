@@ -8,7 +8,7 @@
     "dev": "nodemon server.js",
     "build": "npx prisma generate",
     "postinstall": "npx prisma generate",
-    "deploy": "npx prisma db push --accept-data-loss && node server.js",
+    "deploy": "node server.js",
     "migrate": "npx prisma migrate deploy",
     "db:reset": "npx prisma migrate reset --force",
     "db:seed": "npx prisma db seed",
@@ -24,7 +24,7 @@
     "reservations",
     "real-time"
   ],
-  "author": "Uncle10",
+  "author": "Your Name",
   "license": "MIT",
   "dependencies": {
     "@paralleldrive/cuid2": "^2.2.2",
