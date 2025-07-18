@@ -1,0 +1,144 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Account {
+  id                String  @id @default(cuid())
+  userId            String  @map("user_id")
+  type              String
+  provider          String
+  providerAccountId String  @map("provider_account_id")
+  refresh_token     String?
+  access_token      String?
+  expires_at        Int?
+  token_type        String?
+  scope             String?
+  id_token          String?
+  session_state     String?
+  user              User    @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, providerAccountId])
+  @@map("accounts")
+}
+
+model Session {
+  id           String   @id @default(cuid())
+  sessionToken String   @unique @map("session_token")
+  userId       String   @map("user_id")
+  expires      DateTime
+  user         User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@map("sessions")
+}
+
+model User {
+  id                     String        @id @default(cuid())
+  name                   String?
+  email                  String?       @unique
+  emailVerified          DateTime?     @map("email_verified")
+  image                  String?
+  stripeCustomerId       String?       @unique @map("stripe_customer_id")
+  stripeSubscriptionId   String?       @unique @map("stripe_subscription_id")
+  stripePriceId          String?       @map("stripe_price_id")
+  stripeCurrentPeriodEnd DateTime?     @map("stripe_current_period_end")
+  createdAt              DateTime?     @default(now()) @map("created_at")
+  updatedAt              DateTime?     @default(now()) @updatedAt @map("updated_at")
+  accounts               Account[]
+  bookings               bookings[]
+  sessions               Session[]
+  settings               UserSettings?
+
+  @@map("users")
+}
+
+model VerificationToken {
+  identifier String
+  token      String
+  expires    DateTime
+
+  @@unique([identifier, token])
+  @@map("verificationtokens")
+}
+
+model UserSettings {
+  id                     String   @id @default(cuid())
+  userId                 String   @unique @map("user_id")
+  businessName           String   @map("business_name")
+  businessType           String   @map("business_type")
+  businessDescription    String   @map("business_description")
+  businessAddress        String   @map("business_address")
+  phoneNumber            String   @map("phone_number")
+  operatingHours         Json     @map("operating_hours")
+  languages              String[] @default(["English"])
+  aiPurpose              String[] @map("ai_purpose")
+  bookingMethod          String?  @map("booking_method")
+  customerLimit          Int?     @default(1) @map("customer_limit")
+  thirdPartyUrl          String?  @map("third_party_url")
+  requiredDetails        String[] @default(["name", "phoneNumber"]) @map("required_details")
+  maxBookingsPerTimeSlot Int      @default(1) @map("max_bookings_per_time_slot")
+  summaryFrequency       String   @default("daily") @map("summary_frequency")
+  notificationEmail      String?  @map("notification_email")
+  setupCompleted         Boolean  @default(false) @map("setup_completed")
+  setupVersion           String?  @map("setup_version")
+  createdAt              DateTime @default(now()) @map("created_at")
+  updatedAt              DateTime @default(now()) @updatedAt @map("updated_at")
+  ultravoxAgentId        String?  @map("ultravox_agent_id") @db.VarChar(255)
+  is_recording           Boolean? @default(true)
+  faqs                   FAQ[]
+  user                   User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([setupCompleted])
+  @@map("user_settings")
+}
+
+model FAQ {
+  id             String       @id @default(cuid())
+  userSettingsId String       @map("user_settings_id")
+  question       String
+  answer         String
+  order          Int          @default(0)
+  isActive       Boolean      @default(true) @map("is_active")
+  createdAt      DateTime     @default(now()) @map("created_at")
+  updatedAt      DateTime     @default(now()) @updatedAt @map("updated_at")
+  userSettings   UserSettings @relation(fields: [userSettingsId], references: [id], onDelete: Cascade)
+
+  @@index([isActive])
+  @@index([order])
+  @@index([userSettingsId])
+  @@map("faqs")
+}
+
+model bookings {
+  id             String        @id
+  user_id        String
+  title          String
+  start_time     DateTime
+  end_time       DateTime?
+  status         BookingStatus @default(confirmed)
+  color          String?
+  party_size     String?
+  notes          String?
+  customer_name  String?
+  customer_email String?
+  customer_phone String?
+  created_at     DateTime      @default(now())
+  updated_at     DateTime      @default(now())
+  users          User          @relation(fields: [user_id], references: [id], onDelete: NoAction, onUpdate: NoAction)
+}
+
+model active_phone_numbers {
+  id           String @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  user_id      String @unique @db.VarChar(255)
+  phone_number String @unique
+}
+
+enum BookingStatus {
+  confirmed
+  pending
+  cancelled
+}
