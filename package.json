@@ -24,17 +24,17 @@
     "reservations",
     "real-time"
   ],
-  "author": "Your Name",
+  "author": "Uncle10",
   "license": "MIT",
   "dependencies": {
     "@paralleldrive/cuid2": "^2.2.2",
-    "@prisma/client": "^5.7.1",
+    "@prisma/client": "^6.12.0",
     "cors": "^2.8.5",
     "express": "^4.18.2"
   },
   "devDependencies": {
     "nodemon": "^3.0.2",
-    "prisma": "^5.7.1"
+    "prisma": "^6.12.0"
   },
   "engines": {
     "node": ">=18.0.0",
@@ -42,6 +42,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "your-repo-url"
+    "url": "https://github.com/ThienLuong1101/OrdiReservation.git"
   }
 }
