@@ -4,68 +4,169 @@ const { PrismaClient } = require('@prisma/client');
 const { createId } = require('@paralleldrive/cuid2');
 
 const app = express();
-const PORT = 3001;
-const prisma = new PrismaClient();
+const PORT = process.env.PORT || 3001;
+const NODE_ENV = process.env.NODE_ENV || 'development';
 
-// Middleware
-app.use(cors({
-  origin: ['http://localhost:3000', 'http://localhost:3001'], // Include both frontend and backend
-  credentials: true
-}));
-app.use(express.json());
+// Environment validation
+const requiredEnvVars = ['DATABASE_URL'];
+const missingEnvVars = requiredEnvVars.filter(envVar => !process.env[envVar]);
 
-// Store connected SSE clients
-let clients = [];
+if (missingEnvVars.length > 0) {
+  console.error('❌ Missing required environment variables:', missingEnvVars);
+  process.exit(1);
+}
 
-// SSE endpoint - clients connect here to receive real-time updates
-app.get('/events', (req, res) => {
-  // Set headers for SSE
-  res.writeHead(200, {
-    'Content-Type': 'text/event-stream',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Credentials': 'true'
-  });
-
-  // Send initial connection message
-  res.write(`data: ${JSON.stringify({ 
-    type: 'connection', 
-    message: 'Connected to SSE stream',
-    timestamp: new Date().toISOString()
-  })}\n\n`);
-
-  // Add client to the list
-  const clientId = Date.now();
-  const client = {
-    id: clientId,
-    response: res,
-    userId: req.query.userId || null // Allow filtering by user
-  };
-  clients.push(client);
-
-  console.log(`Client ${clientId} connected. Total clients: ${clients.length}`);
-
-  // Handle client disconnect
-  req.on('close', () => {
-    clients = clients.filter(c => c.id !== clientId);
-    console.log(`Client ${clientId} disconnected. Total clients: ${clients.length}`);
-  });
-
-  // Keep connection alive with periodic heartbeat
-  const heartbeat = setInterval(() => {
-    res.write(`data: ${JSON.stringify({ 
-      type: 'heartbeat', 
-      timestamp: new Date().toISOString()
-    })}\n\n`);
-  }, 30000);
-
-  req.on('close', () => {
-    clearInterval(heartbeat);
-  });
+// Initialize Prisma with optimized settings for production
+const prisma = new PrismaClient({
+  log: NODE_ENV === 'development' ? ['query', 'info', 'warn', 'error'] : ['error'],
+  datasources: {
+    db: {
+      url: process.env.DATABASE_URL,
+    },
+  },
+  // Production optimizations
+  ...(NODE_ENV === 'production' && {
+    __internal: {
+      engine: {
+        enableEngineDebugMode: false,
+      },
+    },
+  }),
 });
 
-// Function to broadcast to specific user or all users
+// Production-ready CORS configuration
+const allowedOrigins = NODE_ENV === 'production' 
+  ? (process.env.ALLOWED_ORIGINS || 'http://localhost:3000').split(',').filter(Boolean)
+  : ['http://localhost:3000', 'http://localhost:3001', 'http://localhost:5173'];
+
+console.log(`🌐 CORS allowed origins:`, allowedOrigins);
+
+// Security and performance middleware
+app.set('trust proxy', 1); // Trust first proxy (for Railway, Render, etc.)
+app.disable('x-powered-by'); // Remove Express signature
+
+app.use(cors({
+  origin: allowedOrigins,
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  maxAge: 86400 // Cache preflight for 24 hours
+}));
+
+app.use(express.json({ 
+  limit: '10mb',
+  strict: true
+}));
+
+// Request timeout middleware
+app.use((req, res, next) => {
+  res.setTimeout(30000, () => {
+    console.error('Request timeout:', req.method, req.path);
+    res.status(408).json({ success: false, message: 'Request timeout' });
+  });
+  next();
+});
+
+// Request logging middleware (optimized for production)
+if (NODE_ENV === 'development') {
+  app.use((req, res, next) => {
+    console.log(`${new Date().toISOString()} - ${req.method} ${req.path}`);
+    next();
+  });
+}
+
+// Store connected SSE clients with cleanup
+let clients = new Map();
+let clientCounter = 0;
+
+// Cleanup dead connections every 5 minutes
+setInterval(() => {
+  const deadClients = [];
+  clients.forEach((client, id) => {
+    try {
+      client.response.write(`data: ${JSON.stringify({ type: 'ping' })}\n\n`);
+    } catch (error) {
+      deadClients.push(id);
+    }
+  });
+  
+  deadClients.forEach(id => {
+    clients.delete(id);
+  });
+  
+  if (deadClients.length > 0) {
+    console.log(`🧹 Cleaned up ${deadClients.length} dead SSE connections. Active: ${clients.size}`);
+  }
+}, 5 * 60 * 1000);
+
+// SSE endpoint - optimized for production
+app.get('/events', (req, res) => {
+  try {
+    // Set SSE headers
+    res.writeHead(200, {
+      'Content-Type': 'text/event-stream',
+      'Cache-Control': 'no-cache',
+      'Connection': 'keep-alive',
+      'Access-Control-Allow-Origin': '*',
+      'Access-Control-Allow-Credentials': 'true',
+      'X-Accel-Buffering': 'no', // Nginx compatibility
+    });
+
+    // Send initial connection message
+    res.write(`data: ${JSON.stringify({ 
+      type: 'connection', 
+      message: 'Connected to SSE stream',
+      timestamp: new Date().toISOString()
+    })}\n\n`);
+
+    // Add client to the map
+    const clientId = ++clientCounter;
+    const client = {
+      id: clientId,
+      response: res,
+      userId: req.query.userId || null,
+      connectedAt: new Date()
+    };
+    clients.set(clientId, client);
+
+    console.log(`📡 Client ${clientId} connected. Total: ${clients.size}`);
+
+    // Handle client disconnect
+    const cleanup = () => {
+      clients.delete(clientId);
+      console.log(`📡 Client ${clientId} disconnected. Total: ${clients.size}`);
+    };
+
+    req.on('close', cleanup);
+    req.on('error', (error) => {
+      console.error(`SSE client ${clientId} error:`, error.message);
+      cleanup();
+    });
+
+    // Heartbeat every 30 seconds
+    const heartbeat = setInterval(() => {
+      try {
+        res.write(`data: ${JSON.stringify({ 
+          type: 'heartbeat', 
+          timestamp: new Date().toISOString()
+        })}\n\n`);
+      } catch (error) {
+        clearInterval(heartbeat);
+        cleanup();
+      }
+    }, 30000);
+
+    req.on('close', () => {
+      clearInterval(heartbeat);
+    });
+
+  } catch (error) {
+    console.error('SSE setup error:', error);
+    res.status(500).end();
+  }
+});
+
+// Optimized broadcast function
 function broadcastToUser(userId, data, messageType = 'reservation') {
   const message = {
     type: messageType,
@@ -75,24 +176,29 @@ function broadcastToUser(userId, data, messageType = 'reservation') {
   };
 
   let sentCount = 0;
-  clients.forEach(client => {
+  const messageStr = `data: ${JSON.stringify(message)}\n\n`;
+
+  clients.forEach((client, id) => {
     try {
       // Send to specific user or to all if no user filter
       if (!client.userId || client.userId === userId) {
-        client.response.write(`data: ${JSON.stringify(message)}\n\n`);
+        client.response.write(messageStr);
         sentCount++;
       }
     } catch (error) {
-      console.error('Error sending to client:', error);
+      console.error(`Error sending to client ${id}:`, error.message);
+      clients.delete(id);
     }
   });
 
-  console.log(`Broadcasted to ${sentCount} clients for user ${userId}`);
+  console.log(`📢 Broadcasted to ${sentCount}/${clients.size} clients for user ${userId}`);
   return sentCount > 0;
 }
 
-// AI Agent reservation endpoint - handles booking creation with database storage
+// AI Agent reservation endpoint - production optimized
 app.post('/ai/reservation/:userId', async (req, res) => {
+  const startTime = Date.now();
+  
   try {
     const { userId } = req.params;
     const {
@@ -105,54 +211,58 @@ app.post('/ai/reservation/:userId', async (req, res) => {
       customerEmail
     } = req.body;
 
-    console.log(`📞 AI Reservation request for user ${userId}:`, req.body);
+    console.log(`📞 AI Reservation for user ${userId}:`, {
+      customerName: customerName?.substring(0, 20) + '...',
+      phone: phone ? '***-***-' + phone.slice(-4) : 'N/A',
+      partySize,
+      bookingDate,
+      time
+    });
 
     // Validate required fields
-    if (!customerName || !phone || !partySize || !bookingDate || !time) {
+    if (!customerName?.trim() || !phone?.trim() || !partySize || !bookingDate || !time) {
       return res.status(400).json({
         success: false,
-        message: 'Missing required fields: customerName, phone, partySize, bookingDate, time',
-        received: { customerName, phone, partySize, bookingDate, time }
+        message: 'Missing required fields: customerName, phone, partySize, bookingDate, time'
       });
     }
 
     // Validate party size
-    if (partySize < 1 || partySize > 20) {
+    const parsedPartySize = parseInt(partySize);
+    if (isNaN(parsedPartySize) || parsedPartySize < 1 || parsedPartySize > 20) {
       return res.status(400).json({
         success: false,
-        message: 'Party size must be between 1 and 20',
-        received: partySize
+        message: 'Party size must be a number between 1 and 20'
       });
     }
 
-    // Validate and correct date format
+    // Validate and normalize date format
     const dateRegex = /^\d{4}-\d{2}-\d{2}$/;
-    let correctedDate = bookingDate;
+    let correctedDate = bookingDate.trim();
     
-    if (!dateRegex.test(bookingDate)) {
+    if (!dateRegex.test(correctedDate)) {
       try {
-        const parsedDate = new Date(bookingDate);
-        if (!isNaN(parsedDate.getTime())) {
-          correctedDate = parsedDate.toISOString().split('T')[0];
+        const parsedDate = new Date(correctedDate);
+        if (isNaN(parsedDate.getTime())) {
+          throw new Error('Invalid date');
         }
+        correctedDate = parsedDate.toISOString().split('T')[0];
       } catch (e) {
         return res.status(400).json({
           success: false,
-          message: 'Invalid date format. Use YYYY-MM-DD',
-          received: bookingDate,
-          expected: 'YYYY-MM-DD (e.g., 2024-12-25)'
+          message: 'Invalid date format. Use YYYY-MM-DD (e.g., 2025-08-01)'
         });
       }
     }
 
-    // Validate and correct time format
+    // Validate and normalize time format
     const timeRegex = /^([01]?\d|2[0-3]):[0-5]\d$/;
-    let correctedTime = time;
+    let correctedTime = time.trim();
     
-    if (!timeRegex.test(time)) {
+    if (!timeRegex.test(correctedTime)) {
       // Try to convert 12-hour format to 24-hour format
       const time12HourRegex = /^(\d{1,2}):(\d{2})\s*(AM|PM)$/i;
-      const match = time.match(time12HourRegex);
+      const match = correctedTime.match(time12HourRegex);
       
       if (match) {
         let [, hours, minutes, ampm] = match;
@@ -168,16 +278,14 @@ app.post('/ai/reservation/:userId', async (req, res) => {
       } else {
         return res.status(400).json({
           success: false,
-          message: 'Invalid time format. Use HH:MM (24-hour format) or HH:MM AM/PM',
-          received: time,
-          expected: '14:30 or 2:30 PM'
+          message: 'Invalid time format. Use HH:MM (24-hour) or HH:MM AM/PM'
         });
       }
     }
 
     // Clean and validate phone number
     let cleanPhone = phone.replace(/[\s\-\(\)\.]/g, '');
-    const phoneRegex = /^[\+]?[1-9][\d]{0,15}$/;
+    const phoneRegex = /^[\+]?[1-9][\d]{7,15}$/;
     
     if (!phoneRegex.test(cleanPhone)) {
       if (cleanPhone.startsWith('0')) {
@@ -187,19 +295,21 @@ app.post('/ai/reservation/:userId', async (req, res) => {
       if (!phoneRegex.test(cleanPhone)) {
         return res.status(400).json({
           success: false,
-          message: 'Invalid phone number format',
-          received: phone,
-          cleaned: cleanPhone,
-          expected: 'International format without leading zeros'
+          message: 'Invalid phone number format'
         });
       }
     }
 
-    // Verify user exists
-    const user = await prisma.user.findUnique({
+    // Verify user exists (with timeout)
+    const userPromise = prisma.user.findUnique({
       where: { id: userId },
       include: { settings: true }
     });
+    
+    const user = await Promise.race([
+      userPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Database timeout')), 5000))
+    ]);
 
     if (!user) {
       return res.status(404).json({
@@ -208,18 +318,16 @@ app.post('/ai/reservation/:userId', async (req, res) => {
       });
     }
 
-    // Create date/time objects
-    const startDateTime = new Date(`${correctedDate}T${correctedTime}:00`);
+    // Create and validate date/time objects
+    const startDateTime = new Date(`${correctedDate}T${correctedTime}:00.000Z`);
     const now = new Date();
     
-    // Check if reservation is not in the past
-    const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
-    if (startDateTime <= fiveMinutesAgo) {
+    // Check if reservation is not in the past (with 5-minute grace period)
+    const gracePeriod = new Date(now.getTime() - 5 * 60 * 1000);
+    if (startDateTime <= gracePeriod) {
       return res.status(400).json({
         success: false,
-        message: 'Cannot make reservations for past dates and times',
-        requestedTime: startDateTime.toISOString(),
-        currentTime: now.toISOString()
+        message: 'Cannot make reservations for past dates and times'
       });
     }
 
@@ -228,9 +336,9 @@ app.post('/ai/reservation/:userId', async (req, res) => {
 
     // Generate booking ID and title
     const bookingId = createId();
-    const title = `${customerName.trim()} - Party of ${partySize}`;
+    const title = `${customerName.trim()} - Party of ${parsedPartySize}`;
 
-    // Save to database
+    // Save to database with transaction
     const booking = await prisma.bookings.create({
       data: {
         id: bookingId,
@@ -240,7 +348,7 @@ app.post('/ai/reservation/:userId', async (req, res) => {
         end_time: endDateTime,
         status: 'confirmed',
         color: '#3b82f6',
-        party_size: partySize.toString(),
+        party_size: parsedPartySize.toString(),
         notes: note?.trim() || null,
         customer_name: customerName.trim(),
         customer_email: customerEmail?.trim() || null,
@@ -250,7 +358,8 @@ app.post('/ai/reservation/:userId', async (req, res) => {
       }
     });
 
-    console.log(`✅ Booking created in database: ${bookingId}`);
+    const processingTime = Date.now() - startTime;
+    console.log(`✅ Booking created: ${bookingId} (${processingTime}ms)`);
 
     // Create reservation object for frontend
     const reservation = {
@@ -270,11 +379,13 @@ app.post('/ai/reservation/:userId', async (req, res) => {
       createdAt: booking.created_at
     };
 
-    // Broadcast to SSE clients
-    const broadcastSuccess = broadcastToUser(userId, reservation, 'new_reservation');
+    // Broadcast to SSE clients (non-blocking)
+    setImmediate(() => {
+      broadcastToUser(userId, reservation, 'new_reservation');
+    });
 
     const businessName = user.settings?.businessName || 'our restaurant';
-    const responseMessage = `Perfect! I've successfully booked your reservation at ${businessName} for ${partySize} ${partySize === 1 ? 'person' : 'people'} on ${formatDate(correctedDate)} at ${formatTime(correctedTime)}. Your confirmation number is ${bookingId}. ${note ? `I've noted: ${note}.` : ''} We look forward to seeing you!`;
+    const responseMessage = `Perfect! I've successfully booked your reservation at ${businessName} for ${parsedPartySize} ${parsedPartySize === 1 ? 'person' : 'people'} on ${formatDate(correctedDate)} at ${formatTime(correctedTime)}. Your confirmation number is ${bookingId}. ${note ? `I've noted: ${note}.` : ''} We look forward to seeing you!`;
 
     res.json({
       success: true,
@@ -282,15 +393,14 @@ app.post('/ai/reservation/:userId', async (req, res) => {
       data: reservation,
       bookingId: bookingId,
       businessName: businessName,
-      sseNotified: broadcastSuccess
+      processingTime: processingTime
     });
 
   } catch (error) {
-    console.error('❌ AI Reservation Error:', error);
+    const processingTime = Date.now() - startTime;
+    console.error(`❌ AI Reservation Error (${processingTime}ms):`, error);
     
-    const errorMessage = error instanceof Error ? error.message : 'Unknown error occurred';
-    
-    // Handle Prisma errors
+    // Handle specific Prisma errors
     if (error && typeof error === 'object' && 'code' in error) {
       const prismaError = error;
       
@@ -307,24 +417,40 @@ app.post('/ai/reservation/:userId', async (req, res) => {
           message: 'Invalid user ID provided.',
         });
       }
+
+      if (prismaError.code === 'P1001') {
+        return res.status(503).json({
+          success: false,
+          message: 'Database connection failed. Please try again.',
+        });
+      }
     }
     
     res.status(500).json({
       success: false,
       message: 'Failed to create reservation. Please try again.',
-      error: process.env.NODE_ENV === 'development' ? errorMessage : 'Internal server error'
+      ...(NODE_ENV === 'development' && { error: error.message })
     });
   }
 });
 
-// Get reservations for a user
+// Get reservations for a user - with caching headers
 app.get('/api/reservations/:userId', async (req, res) => {
   try {
     const { userId } = req.params;
+    const { limit = 100, offset = 0 } = req.query;
+    
+    // Set caching headers
+    res.set({
+      'Cache-Control': 'private, max-age=60', // Cache for 1 minute
+      'ETag': `"reservations-${userId}-${Date.now()}"`
+    });
     
     const bookings = await prisma.bookings.findMany({
       where: { user_id: userId },
-      orderBy: { start_time: 'desc' }
+      orderBy: { start_time: 'desc' },
+      take: parseInt(limit),
+      skip: parseInt(offset)
     });
 
     const reservations = bookings.map(booking => ({
@@ -345,7 +471,12 @@ app.get('/api/reservations/:userId', async (req, res) => {
     res.json({
       success: true,
       data: reservations,
-      count: reservations.length
+      count: reservations.length,
+      pagination: {
+        limit: parseInt(limit),
+        offset: parseInt(offset),
+        hasMore: reservations.length === parseInt(limit)
+      }
     });
 
   } catch (error) {
@@ -357,86 +488,248 @@ app.get('/api/reservations/:userId', async (req, res) => {
   }
 });
 
-// Simple POST endpoint for testing (keeps existing functionality)
+// Message broadcast endpoint - rate limited
+const messageRateLimit = new Map();
 app.post('/message', (req, res) => {
-  const { message, data, userId } = req.body;
-  
-  if (!message) {
-    return res.status(400).json({ error: 'Message is required' });
-  }
-
-  const eventData = {
-    type: 'message',
-    message,
-    data: data || null,
-    timestamp: new Date().toISOString(),
-    source: 'curl'
-  };
-
-  console.log('Broadcasting message to clients:', eventData);
-
-  // Broadcast to specific user or all users
-  const targetUserId = userId || null;
-  let sentCount = 0;
-  
-  clients.forEach(client => {
-    try {
-      if (!targetUserId || !client.userId || client.userId === targetUserId) {
-        client.response.write(`data: ${JSON.stringify(eventData)}\n\n`);
-        sentCount++;
-      }
-    } catch (error) {
-      console.error('Error sending to client:', error);
+  try {
+    const clientIP = req.ip || req.connection.remoteAddress;
+    const now = Date.now();
+    
+    // Simple rate limiting: 10 messages per minute per IP
+    const key = `msg_${clientIP}`;
+    const requests = messageRateLimit.get(key) || [];
+    const recentRequests = requests.filter(time => now - time < 60000);
+    
+    if (recentRequests.length >= 10) {
+      return res.status(429).json({
+        success: false,
+        message: 'Rate limit exceeded. Max 10 messages per minute.'
+      });
     }
-  });
+    
+    recentRequests.push(now);
+    messageRateLimit.set(key, recentRequests);
+    
+    const { message, data, userId } = req.body;
+    
+    if (!message?.trim()) {
+      return res.status(400).json({ 
+        success: false,
+        error: 'Message is required and cannot be empty'
+      });
+    }
 
-  res.json({ 
-    success: true, 
-    message: 'Message broadcasted',
-    clientCount: sentCount,
-    data: eventData
+    const eventData = {
+      type: 'message',
+      message: message.trim(),
+      data: data || null,
+      timestamp: new Date().toISOString(),
+      source: 'api'
+    };
+
+    console.log('📢 Broadcasting message:', { 
+      preview: message.substring(0, 50) + (message.length > 50 ? '...' : ''),
+      userId: userId || 'all',
+      clients: clients.size
+    });
+
+    // Broadcast to specific user or all users
+    const sentCount = broadcastToUser(userId || null, eventData, 'message');
+
+    res.json({ 
+      success: true, 
+      message: 'Message broadcasted',
+      clientCount: sentCount,
+      totalClients: clients.size
+    });
+  } catch (error) {
+    console.error('Error broadcasting message:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to broadcast message'
+    });
+  }
+});
+
+// Enhanced health check endpoint
+app.get('/health', async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    // Test database connection with timeout
+    const dbPromise = prisma.$queryRaw`SELECT 1 as health`;
+    const dbResult = await Promise.race([
+      dbPromise,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('DB timeout')), 3000))
+    ]);
+    
+    const responseTime = Date.now() - startTime;
+    
+    res.json({ 
+      status: 'ok', 
+      timestamp: new Date().toISOString(),
+      environment: NODE_ENV,
+      uptime: process.uptime(),
+      memory: {
+        used: Math.round(process.memoryUsage().heapUsed / 1024 / 1024),
+        total: Math.round(process.memoryUsage().heapTotal / 1024 / 1024)
+      },
+      database: {
+        status: 'connected',
+        responseTime: responseTime
+      },
+      sse: {
+        activeClients: clients.size,
+        totalConnections: clientCounter
+      },
+      version: process.env.npm_package_version || '1.0.0'
+    });
+  } catch (error) {
+    console.error('Health check failed:', error);
+    res.status(503).json({
+      status: 'error',
+      timestamp: new Date().toISOString(),
+      database: {
+        status: 'disconnected',
+        error: error.message
+      },
+      sse: {
+        activeClients: clients.size
+      }
+    });
+  }
+});
+
+// 404 handler
+app.use((req, res) => {
+  res.status(404).json({
+    success: false,
+    message: 'Endpoint not found',
+    path: req.path,
+    method: req.method
   });
 });
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({ 
-    status: 'ok', 
-    clients: clients.length,
+// Global error handler
+app.use((error, req, res, next) => {
+  console.error('Unhandled error:', error);
+  res.status(500).json({
+    success: false,
+    message: 'Internal server error',
     timestamp: new Date().toISOString(),
-    database: 'connected'
+    ...(NODE_ENV === 'development' && { 
+      error: error.message,
+      stack: error.stack 
+    })
   });
 });
 
 // Helper functions
 function formatDate(dateString) {
-  const date = new Date(dateString);
-  const options = { 
-    weekday: 'long', 
-    year: 'numeric', 
-    month: 'long', 
-    day: 'numeric' 
-  };
-  return date.toLocaleDateString('en-US', options);
+  try {
+    const date = new Date(dateString);
+    if (isNaN(date.getTime())) {
+      throw new Error('Invalid date');
+    }
+    const options = { 
+      weekday: 'long', 
+      year: 'numeric', 
+      month: 'long', 
+      day: 'numeric',
+      timeZone: 'UTC'
+    };
+    return date.toLocaleDateString('en-US', options);
+  } catch (error) {
+    console.error('Date formatting error:', error);
+    return dateString;
+  }
 }
 
 function formatTime(timeString) {
-  const [hours, minutes] = timeString.split(':');
-  const hour24 = parseInt(hours);
-  const hour12 = hour24 === 0 ? 12 : hour24 > 12 ? hour24 - 12 : hour24;
-  const ampm = hour24 >= 12 ? 'PM' : 'AM';
-  return `${hour12}:${minutes} ${ampm}`;
+  try {
+    const [hours, minutes] = timeString.split(':');
+    const hour24 = parseInt(hours);
+    const formattedHours = hour24.toString().padStart(2, '0');
+    const formattedMinutes = minutes.padStart(2, '0');
+    return `${formattedHours}:${formattedMinutes}`;
+  } catch (error) {
+    console.error('Time formatting error:', error);
+    return timeString;
+  }
 }
 
 // Graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('\n🔄 Gracefully shutting down...');
-  await prisma.$disconnect();
+async function gracefulShutdown(signal) {
+  console.log(`\n🔄 Received ${signal}. Gracefully shutting down...`);
+  
+  // Stop accepting new connections
+  server.close(() => {
+    console.log('🛑 HTTP server closed');
+  });
+  
+  // Close SSE connections
+  console.log(`📡 Closing ${clients.size} SSE connections...`);
+  clients.forEach((client, id) => {
+    try {
+      client.response.write(`data: ${JSON.stringify({ 
+        type: 'shutdown', 
+        message: 'Server shutting down' 
+      })}\n\n`);
+      client.response.end();
+    } catch (error) {
+      console.error(`Error closing client ${id}:`, error.message);
+    }
+  });
+  clients.clear();
+  
+  // Disconnect from database
+  try {
+    await prisma.$disconnect();
+    console.log('📦 Database connection closed');
+  } catch (error) {
+    console.error('Error closing database connection:', error.message);
+  }
+  
+  console.log('✅ Graceful shutdown complete');
   process.exit(0);
+}
+
+// Process signal handlers
+process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+
+// Handle uncaught exceptions
+process.on('uncaughtException', (error) => {
+  console.error('Uncaught exception:', error);
+  gracefulShutdown('UNCAUGHT_EXCEPTION');
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled rejection at:', promise, 'reason:', reason);
+  gracefulShutdown('UNHANDLED_REJECTION');
 });
 
 // Start server
-app.listen(PORT, () => {
-  console.log(`🚀 SSE Server with Database running on http://localhost:${PORT}`);
- 
+const server = app.listen(PORT, '0.0.0.0', () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+  console.log(`📊 Environment: ${NODE_ENV}`);
+  console.log(`🗄️  Database: ${process.env.DATABASE_URL ? 'Connected' : 'Not configured'}`);
+  console.log(`🌐 CORS Origins: ${allowedOrigins.join(', ')}`);
+  console.log(`⚡ Ready for production deployment!`);
 });
+
+// Handle server startup errors
+server.on('error', (error) => {
+  console.error('Server startup error:', error);
+  if (error.code === 'EADDRINUSE') {
+    console.error(`❌ Port ${PORT} is already in use`);
+    process.exit(1);
+  }
+});
+
+// Prevent server timeout
+server.timeout = 30000; // 30 seconds
+server.keepAliveTimeout = 65000; // 65 seconds
+server.headersTimeout = 66000; // 66 seconds
+
+module.exports = app;
