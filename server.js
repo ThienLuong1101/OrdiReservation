@@ -3,10 +3,21 @@ const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const { createId } = require('@paralleldrive/cuid2');
 
+const express = require('express');
+const cors = require('cors');
+const { PrismaClient } = require('@prisma/client');
+const { createId } = require('@paralleldrive/cuid2');
+
 const app = express();
 const PORT = process.env.PORT || 3001;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
+console.log('🔄 Starting server initialization...');
+console.log('📊 Node.js version:', process.version);
+console.log('📊 Environment variables:');
+console.log('  - NODE_ENV:', NODE_ENV);
+console.log('  - PORT:', PORT);
+console.log('  - DATABASE_URL:', process.env.DATABASE_URL ? 'SET' : 'NOT SET');
 
 // Environment validation
 const requiredEnvVars = [];
@@ -731,26 +742,35 @@ async function gracefulShutdown(signal) {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-// Handle uncaught exceptions (improved)
+// Handle uncaught exceptions (prevent SSE crashes)
 process.on('uncaughtException', (error) => {
   console.error('💥 Uncaught exception:', error);
   console.error('Stack:', error.stack);
   
-  // Don't exit immediately on SSE-related errors
-  if (error.code === 'ERR_HTTP_HEADERS_SENT' && error.message.includes('SSE')) {
-    console.log('⚠️ SSE-related error, continuing operation...');
+  // Don't exit on SSE-related header errors
+  if (error.code === 'ERR_HTTP_HEADERS_SENT') {
+    console.log('⚠️ Headers already sent error (likely SSE related) - continuing operation...');
     return;
   }
   
-  // For other uncaught exceptions, gracefully shutdown
+  // Don't exit on other common SSE errors
+  if (error.message && (
+    error.message.includes('Cannot set headers') ||
+    error.message.includes('write after end') ||
+    error.message.includes('This socket has been ended')
+  )) {
+    console.log('⚠️ SSE connection error - continuing operation...');
+    return;
+  }
+  
+  // For other critical errors, gracefully shutdown
+  console.log('🚨 Critical error detected, shutting down...');
   gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
 
 process.on('unhandledRejection', (reason, promise) => {
   console.error('💥 Unhandled rejection at:', promise, 'reason:', reason);
-  
-  // Don't shutdown for promise rejections, just log them
-  console.log('⚠️ Continuing operation after unhandled rejection...');
+  console.log('⚠️ Unhandled rejection - continuing operation...');
 });
 
 // Start server
