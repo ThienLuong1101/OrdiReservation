@@ -3,11 +3,6 @@ const cors = require('cors');
 const { PrismaClient } = require('@prisma/client');
 const { createId } = require('@paralleldrive/cuid2');
 
-const express = require('express');
-const cors = require('cors');
-const { PrismaClient } = require('@prisma/client');
-const { createId } = require('@paralleldrive/cuid2');
-
 const app = express();
 const PORT = process.env.PORT || 3001;
 const NODE_ENV = process.env.NODE_ENV || 'development';
