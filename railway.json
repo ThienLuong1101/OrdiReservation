@@ -5,10 +5,10 @@
     "buildCommand": "npm install && npx prisma generate"
   },
   "deploy": {
-    "startCommand": "npm run deploy",
+    "startCommand": "node server.js",
     "restartPolicyType": "ON_FAILURE",
-    "restartPolicyMaxRetries": 10,
-    "healthcheckPath": "/health",
-    "healthcheckTimeout": 30
+    "restartPolicyMaxRetries": 3,
+    "healthcheckPath": "/disabled",
+    "healthcheckTimeout": 300
   }
 }
