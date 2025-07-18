@@ -7,8 +7,12 @@ const app = express();
 const PORT = process.env.PORT || 3001;
 const NODE_ENV = process.env.NODE_ENV || 'development';
 
+
 // Environment validation
-const requiredEnvVars = ['DATABASE_URL'];
+const requiredEnvVars = [];
+if (NODE_ENV === 'production') {
+  requiredEnvVars.push('DATABASE_URL');
+}
 const missingEnvVars = requiredEnvVars.filter(envVar => !process.env[envVar]);
 
 if (missingEnvVars.length > 0) {
@@ -82,9 +86,26 @@ let clientCounter = 0;
 // Cleanup dead connections every 5 minutes
 setInterval(() => {
   const deadClients = [];
+  const now = Date.now();
+  
   clients.forEach((client, id) => {
     try {
-      client.response.write(`data: ${JSON.stringify({ type: 'ping' })}\n\n`);
+      // Check if response is destroyed or ended
+      if (client.response.destroyed || client.response.writableEnded) {
+        deadClients.push(id);
+        return;
+      }
+      
+      // Check if connection is too old (over 2 hours without activity)
+      const connectionAge = now - client.connectedAt.getTime();
+      if (connectionAge > 2 * 60 * 60 * 1000) {
+        deadClients.push(id);
+        try {
+          client.response.end();
+        } catch (error) {
+          // Connection already closed
+        }
+      }
     } catch (error) {
       deadClients.push(id);
     }
@@ -177,21 +198,33 @@ function broadcastToUser(userId, data, messageType = 'reservation') {
 
   let sentCount = 0;
   const messageStr = `data: ${JSON.stringify(message)}\n\n`;
+  const deadClients = [];
 
   clients.forEach((client, id) => {
     try {
       // Send to specific user or to all if no user filter
       if (!client.userId || client.userId === userId) {
+        // Check if response is still writable
+        if (client.response.destroyed || client.response.writableEnded) {
+          deadClients.push(id);
+          return;
+        }
+        
         client.response.write(messageStr);
         sentCount++;
       }
     } catch (error) {
-      console.error(`Error sending to client ${id}:`, error.message);
-      clients.delete(id);
+      console.error(`❌ Error sending to client ${id}:`, error.message);
+      deadClients.push(id);
     }
   });
 
-  console.log(`📢 Broadcasted to ${sentCount}/${clients.size} clients for user ${userId}`);
+  // Remove dead clients
+  deadClients.forEach(id => {
+    clients.delete(id);
+  });
+
+  console.log(`📢 Broadcasted to ${sentCount}/${clients.size} clients for user ${userId}${deadClients.length > 0 ? ` (removed ${deadClients.length} dead clients)` : ''}`);
   return sentCount > 0;
 }
 
@@ -698,15 +731,26 @@ async function gracefulShutdown(signal) {
 process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
 
-// Handle uncaught exceptions
+// Handle uncaught exceptions (improved)
 process.on('uncaughtException', (error) => {
-  console.error('Uncaught exception:', error);
+  console.error('💥 Uncaught exception:', error);
+  console.error('Stack:', error.stack);
+  
+  // Don't exit immediately on SSE-related errors
+  if (error.code === 'ERR_HTTP_HEADERS_SENT' && error.message.includes('SSE')) {
+    console.log('⚠️ SSE-related error, continuing operation...');
+    return;
+  }
+  
+  // For other uncaught exceptions, gracefully shutdown
   gracefulShutdown('UNCAUGHT_EXCEPTION');
 });
 
 process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled rejection at:', promise, 'reason:', reason);
-  gracefulShutdown('UNHANDLED_REJECTION');
+  console.error('💥 Unhandled rejection at:', promise, 'reason:', reason);
+  
+  // Don't shutdown for promise rejections, just log them
+  console.log('⚠️ Continuing operation after unhandled rejection...');
 });
 
 // Start server
